@@ -5,16 +5,17 @@ Responsibilities
 ----------------
 1. Probe localhost hermes endpoints every 30s; cache latest snapshot.
 2. Expose JSON API to the public dashboard frontend.
-3. Persist daily token rollups to SQLite at 23:59 local time (CDT).
+3. Serve the static Next.js frontend from /.
+
+Data sources
+------------
+- Live state: hermes --version, .update_check, .install_method, config.yaml model.default
+- Live token snapshot: http://localhost:8080/api/status (last-call view, used only for MiMo quota)
+- Daily token rollups: ~/.hermes/token_stats/YYYY-MM-DD.json (authoritative — produced by token_tracker.py cron)
+- Cumulative summary: ~/.hermes/token_stats/summary.json (produced by token_tracker.py)
 
 Run:
     uvicorn dashboard:app --host 0.0.0.0 --port 8800
-
-Env:
-    HERMES_API_URL   default http://localhost:8080/api/status
-    SERVICES_JSON    JSON map of {label: {name, url, critical, icon}}
-                     override the built-in service map
-    DB_PATH          default /Users/ethanwu/workspace/hermes-dashboard/backend/dashboard.db
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ import asyncio
 import json
 import logging
 import os
-import sqlite3
+import re
 import subprocess
 import time
 from datetime import datetime, timezone, timedelta
@@ -30,113 +31,48 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+import yaml
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
-CDT = timezone(timedelta(hours=-5))  # America/Chicago (CST=UTC-6, CDT=UTC-5)
-# For real production use we should derive from system; keep static for now
-# since the entire host runs in America/Chicago.
+CDT = timezone(timedelta(hours=-5))  # America/Chicago (CDT=UTC-5)
 
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
 HERMES_API_URL = os.environ.get("HERMES_API_URL", "http://localhost:8080/api/status")
-DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).parent / "dashboard.db")))
+TOKEN_STATS_DIR = HERMES_HOME / "token_stats"
+CONFIG_PATH = HERMES_HOME / "config.yaml"
+STATIC_DIR = Path(__file__).parent / "static"
+
 LOG = logging.getLogger("hermes-dashboard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # -----------------------------------------------------------------------------
-# Static service map. These are the always-on ethanshermes.com tunnel backends.
-# `critical` flags are surfaced visually; they don't trigger push notifications
-# (per owner's design — dashboard is read-only by default).
+# Service map — owner-curated (2026-09-21).
+# Critical services are surfaced visually; no push notifications.
+# Owner explicitly removed: Docs, ComfyUI, Project.
 # -----------------------------------------------------------------------------
 SERVICES_DEFAULT: list[dict[str, Any]] = [
-    {"label": "WebUI",      "host": "ethanshermes.com",      "url": "https://ethanshermes.com",      "local": "http://localhost:8080", "critical": True,  "icon": "webui"},
-    {"label": "Health",     "host": "health.ethanshermes.com","url": "https://health.ethanshermes.com","local": "http://localhost:8089", "critical": True,  "icon": "health"},
-    {"label": "Chat",       "host": "chat.ethanshermes.com",  "url": "https://chat.ethanshermes.com",  "local": "http://localhost:8787", "critical": True,  "icon": "chat"},
-    {"label": "Ethanos",    "host": "ethanos.ethanshermes.com","url": "https://ethanos.ethanshermes.com","local": "http://localhost:3100", "critical": False, "icon": "ethanos"},
-    {"label": "ComfyUI",    "host": "comfyui.ethanshermes.com","url": "https://comfyui.ethanshermes.com","local": "http://localhost:8188", "critical": False, "icon": "comfyui"},
-    {"label": "Docs",       "host": "docs.ethanshermes.com",  "url": "https://docs.ethanshermes.com",  "local": "http://localhost:8765", "critical": False, "icon": "docs"},
-    {"label": "Project",    "host": "project.ethanshermes.com","url": "https://project.ethanshermes.com","local": "http://localhost:8766", "critical": False, "icon": "project"},
-    {"label": "Canvas",     "host": "canvas.ethanshermes.com", "url": "https://canvas.ethanshermes.com", "local": "http://localhost:8770", "critical": False, "icon": "canvas"},
-    {"label": "Clock",      "host": "clock.ethanshermes.com",  "url": "https://clock.ethanshermes.com",  "local": "http://localhost:8771", "critical": True,  "icon": "clock"},
-    {"label": "API",        "host": "api.ethanshermes.com",    "url": "https://api.ethanshermes.com",    "local": "http://localhost:8000", "critical": True,  "icon": "api"},
+    {"label": "WebUI",   "host": "ethanshermes.com",      "url": "https://ethanshermes.com",      "local": "http://localhost:8080", "critical": True,  "icon": "webui",
+     "note": "Hermes WebUI main entry"},
+    {"label": "Health",  "host": "health.ethanshermes.com","url": "https://health.ethanshermes.com","local": "http://localhost:8089", "critical": True,  "icon": "health",
+     "note": "Apple Health data webhook API"},
+    {"label": "Chat",    "host": "chat.ethanshermes.com",  "url": "https://chat.ethanshermes.com",  "local": "http://localhost:8787", "critical": True,  "icon": "chat",
+     "note": "HaiMian chat (Hermes gateway)"},
+    {"label": "Ethanos", "host": "ethanos.ethanshermes.com","url": "https://ethanos.ethanshermes.com","local": "http://localhost:3100", "critical": False, "icon": "ethanos",
+     "note": "ethanos (kept for now — owner to confirm)"},
+    {"label": "Canvas",  "host": "canvas.ethanshermes.com", "url": "https://canvas.ethanshermes.com", "local": "http://localhost:8770", "critical": False, "icon": "canvas",
+     "note": "canvas widget"},
+    {"label": "Clock",   "host": "clock.ethanshermes.com",  "url": "https://clock.ethanshermes.com",  "local": "http://localhost:8771", "critical": True,  "icon": "clock",
+     "note": "mac-clock iOS StandBy 21:9 dock display"},
+    {"label": "API",     "host": "api.ethanshermes.com",    "url": "https://api.ethanshermes.com",    "local": "http://localhost:8000", "critical": True,  "icon": "api",
+     "note": "NexusAgent capstone backend (FastAPI)"},
 ]
-
-# -----------------------------------------------------------------------------
-# SQLite schema
-# -----------------------------------------------------------------------------
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS daily_rollup (
-    date_local TEXT PRIMARY KEY,           -- YYYY-MM-DD (CDT)
-    input_tokens INTEGER NOT NULL DEFAULT 0,
-    output_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-    total_tokens INTEGER NOT NULL DEFAULT 0,
-    estimated_cost_usd REAL NOT NULL DEFAULT 0,
-    rollup_complete INTEGER NOT NULL DEFAULT 0, -- 0 = in-progress day, 1 = sealed
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_rollup_complete ON daily_rollup(rollup_complete);
-"""
-
-
-def db_init() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.executescript(SCHEMA)
-        conn.commit()
-
-
-def db_upsert_today(stats: dict[str, Any], date_local: str, sealed: bool) -> None:
-    """Insert or update today's rollup row. If `sealed`, mark rollup_complete=1."""
-    now_iso = datetime.now(CDT).isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO daily_rollup
-              (date_local, input_tokens, output_tokens, cache_read_tokens,
-               cache_write_tokens, reasoning_tokens, total_tokens,
-               estimated_cost_usd, rollup_complete, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(date_local) DO UPDATE SET
-              input_tokens = excluded.input_tokens,
-              output_tokens = excluded.output_tokens,
-              cache_read_tokens = excluded.cache_read_tokens,
-              cache_write_tokens = excluded.cache_write_tokens,
-              reasoning_tokens = excluded.reasoning_tokens,
-              total_tokens = excluded.total_tokens,
-              estimated_cost_usd = excluded.estimated_cost_usd,
-              rollup_complete = MAX(rollup_complete, excluded.rollup_complete)
-            """,
-            (
-                date_local,
-                int(stats.get("input_tokens", 0)),
-                int(stats.get("output_tokens", 0)),
-                int(stats.get("cache_read_tokens", 0)),
-                int(stats.get("cache_write_tokens", 0)),
-                int(stats.get("reasoning_tokens", 0)),
-                int(stats.get("total_tokens", 0)),
-                float(stats.get("estimated_cost_usd", 0)),
-                1 if sealed else 0,
-                now_iso,
-            ),
-        )
-        conn.commit()
-
-
-def db_get_all_rollups() -> list[dict[str, Any]]:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT * FROM daily_rollup ORDER BY date_local ASC"
-        ).fetchall()
-    return [dict(r) for r in rows]
 
 
 # -----------------------------------------------------------------------------
@@ -149,6 +85,7 @@ class ServiceState(BaseModel):
     local: str
     critical: bool
     icon: str
+    note: str = ""
     status: str = "unknown"          # up | down | unknown
     http_code: int | None = None
     latency_ms: int | None = None
@@ -158,14 +95,17 @@ class ServiceState(BaseModel):
 
 class HermesState(BaseModel):
     version: str = "unknown"
-    upstream_version: str | None = None
     commits_behind: int | None = None
     install_method: str | None = None
-    python: str | None = None
     started_at: str | None = None
     uptime_seconds: int | None = None
-    model: str | None = None
-    provider: str | None = None
+    # Authoritative model — read from config.yaml, NOT from /api/status
+    # (which reports last-call model, not default).
+    configured_model: str | None = None
+    configured_provider: str | None = None
+    # Optional context (last-call view from /api/status).
+    last_call_model: str | None = None
+    last_call_provider: str | None = None
     summary: dict[str, Any] = {}
     mimo_used: int | None = None
     mimo_total: int | None = None
@@ -178,30 +118,50 @@ class Snapshot(BaseModel):
     last_full_refresh: str | None = None
 
 
-SNAPSHOT = Snapshot(hermes=HermesState(), services=[ServiceState(**s) for s in SERVICES_DEFAULT])
+SNAPSHOT = Snapshot(
+    hermes=HermesState(),
+    services=[ServiceState(**{k: s[k] for k in ("label", "host", "url", "local", "critical", "icon", "note")}) for s in SERVICES_DEFAULT],
+)
+
 
 # -----------------------------------------------------------------------------
-# Background probes
+# Helpers
 # -----------------------------------------------------------------------------
+def _read_configured_model() -> tuple[str | None, str | None]:
+    """Return (model.default, provider) from ~/.hermes/config.yaml.
+    Falls back to (None, None) if config is missing or malformed."""
+    if not CONFIG_PATH.exists():
+        return (None, None)
+    try:
+        cfg = yaml.safe_load(CONFIG_PATH.read_text()) or {}
+        m = cfg.get("model") or {}
+        return (m.get("default"), m.get("provider"))
+    except Exception as e:
+        LOG.warning("config.yaml read failed: %s", e)
+        return (None, None)
+
+
 def _detect_hermes_version() -> dict[str, Any]:
-    """Read version + .update_check + .install_method in one shot."""
+    """Read hermes version, .update_check, .install_method."""
     out: dict[str, Any] = {}
     try:
-        out["version"] = subprocess.check_output(
-            ["hermes", "--version"], text=True, stderr=subprocess.STDOUT, timeout=5
-        ).strip().split("\n")[0]
+        raw = subprocess.check_output(["hermes", "--version"], text=True, stderr=subprocess.STDOUT, timeout=5).strip()
+        first = raw.split("\n")[0]
+        # Format: "Hermes Agent v0.21.4 (2026.9.21) · upstream 524041b9"
+        m = re.search(r"v(\d+\.\d+\.\d+)", first)
+        out["version"] = m.group(1) if m else first
     except Exception as e:
         out["version_error"] = str(e)
 
-    update_path = Path.home() / ".hermes" / ".update_check"
+    update_path = HERMES_HOME / ".update_check"
     if update_path.exists():
         try:
             data = json.loads(update_path.read_text())
             out["commits_behind"] = data.get("behind")
         except Exception as e:
-            out["update_check_error"] = str(e)
+            LOG.warning("update_check read failed: %s", e)
 
-    install_path = Path.home() / ".hermes" / ".install_method"
+    install_path = HERMES_HOME / ".install_method"
     if install_path.exists():
         out["install_method"] = install_path.read_text().strip()
 
@@ -227,29 +187,18 @@ async def _probe_one_service(svc: dict[str, Any]) -> ServiceState:
             r = await client.get(svc["local"])
             latency = int((time.perf_counter() - started) * 1000)
             return ServiceState(
-                label=svc["label"],
-                host=svc["host"],
-                url=svc["url"],
-                local=svc["local"],
-                critical=svc["critical"],
-                icon=svc["icon"],
+                label=svc["label"], host=svc["host"], url=svc["url"], local=svc["local"],
+                critical=svc["critical"], icon=svc["icon"], note=svc.get("note", ""),
                 status="up" if r.status_code < 500 else "down",
-                http_code=r.status_code,
-                latency_ms=latency,
+                http_code=r.status_code, latency_ms=latency,
                 last_checked=datetime.now(CDT).isoformat(),
             )
         except Exception as e:
             latency = int((time.perf_counter() - started) * 1000)
             return ServiceState(
-                label=svc["label"],
-                host=svc["host"],
-                url=svc["url"],
-                local=svc["local"],
-                critical=svc["critical"],
-                icon=svc["icon"],
-                status="down",
-                http_code=None,
-                latency_ms=latency,
+                label=svc["label"], host=svc["host"], url=svc["url"], local=svc["local"],
+                critical=svc["critical"], icon=svc["icon"], note=svc.get("note", ""),
+                status="down", http_code=None, latency_ms=latency,
                 last_checked=datetime.now(CDT).isoformat(),
                 error=f"{type(e).__name__}: {e}",
             )
@@ -264,27 +213,27 @@ async def refresh_snapshot() -> None:
     global SNAPSHOT
 
     hermes_meta = _detect_hermes_version()
+    cfg_model, cfg_provider = _read_configured_model()
     api_data = await _probe_hermes_api()
     services = await _probe_all_services()
 
-    version_full = hermes_meta.get("version", "unknown")
-    version_clean = version_full.replace("Hermes Agent v", "").split(" ")[0]
-
-    summary = api_data.get("summary", {}) if "error" not in api_data else {}
+    # Preserve the original started_at across refreshes so uptime keeps growing.
     started_at = SNAPSHOT.hermes.started_at or datetime.now(CDT).isoformat()
     uptime = int((datetime.now(CDT) - datetime.fromisoformat(started_at)).total_seconds())
 
+    summary = api_data.get("summary", {}) if "error" not in api_data else {}
+
     SNAPSHOT = Snapshot(
         hermes=HermesState(
-            version=version_clean,
-            upstream_version=None,
+            version=hermes_meta.get("version", "unknown"),
             commits_behind=hermes_meta.get("commits_behind"),
             install_method=hermes_meta.get("install_method"),
-            python=hermes_meta.get("python"),
             started_at=started_at,
             uptime_seconds=uptime,
-            model=api_data.get("model"),
-            provider=api_data.get("provider"),
+            configured_model=cfg_model,
+            configured_provider=cfg_provider,
+            last_call_model=api_data.get("model"),
+            last_call_provider=api_data.get("provider"),
             summary=summary,
             mimo_used=api_data.get("mimo_used"),
             mimo_total=api_data.get("mimo_total"),
@@ -294,50 +243,49 @@ async def refresh_snapshot() -> None:
         last_full_refresh=datetime.now(CDT).isoformat(),
     )
     LOG.info(
-        "snapshot refreshed: hermes=%s services_up=%d/%d",
-        version_clean,
+        "snapshot refreshed: hermes=%s model=%s/%s services_up=%d/%d",
+        SNAPSHOT.hermes.version,
+        cfg_model or "?",
+        cfg_provider or "?",
         sum(1 for s in services if s.status == "up"),
         len(services),
     )
 
 
 # -----------------------------------------------------------------------------
-# Daily rollup loop — fires at local midnight (00:00 CDT)
+# Daily token rollups — read from ~/.hermes/token_stats/, NOT a separate SQLite.
+# Authoritative source: token_tracker.py cron (job 253c942cc597, 23:55 daily).
 # -----------------------------------------------------------------------------
-async def daily_rollup_loop() -> None:
-    """
-    Every minute, check the wall clock. When local time crosses 00:00 CDT,
-    seal yesterday's row and reset today's row.
-    """
-    last_sealed_date: str | None = None
-    while True:
+def _read_all_daily_rollups() -> list[dict[str, Any]]:
+    """Return list of daily rollup dicts (one per date, newest last).
+    Each dict matches the shape of ~/.hermes/token_stats/YYYY-MM-DD.json."""
+    if not TOKEN_STATS_DIR.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for f in sorted(TOKEN_STATS_DIR.glob("20*.json")):
+        if f.name == "summary.json":
+            continue
         try:
-            now = datetime.now(CDT)
-            today = now.strftime("%Y-%m-%d")
-            if last_sealed_date != today and now.hour == 0 and now.minute < 2:
-                # We just rolled into a new day — seal yesterday's rollup using
-                # the cumulative snapshot. Daily-rollup semantics: one row per day,
-                # value = cumulative at end-of-day.
-                yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-                stats = SNAPSHOT.hermes.summary or {}
-                if stats:
-                    db_upsert_today(stats, yesterday, sealed=True)
-                    LOG.info("sealed daily rollup for %s", yesterday)
-                last_sealed_date = today
-
-            # Always refresh today's row with current cumulative (rollup_complete=0)
-            stats = SNAPSHOT.hermes.summary or {}
-            if stats:
-                db_upsert_today(stats, today, sealed=False)
+            rows.append(json.loads(f.read_text()))
         except Exception as e:
-            LOG.exception("daily rollup loop error: %s", e)
-        await asyncio.sleep(60)
+            LOG.warning("read %s failed: %s", f.name, e)
+    return rows
+
+
+def _read_summary() -> dict[str, Any] | None:
+    sp = TOKEN_STATS_DIR / "summary.json"
+    if not sp.exists():
+        return None
+    try:
+        return json.loads(sp.read_text())
+    except Exception:
+        return None
 
 
 # -----------------------------------------------------------------------------
 # FastAPI app
 # -----------------------------------------------------------------------------
-app = FastAPI(title="Hermes Dashboard", version="1.0.0")
+app = FastAPI(title="Hermes Dashboard", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -348,11 +296,9 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def _startup() -> None:
-    db_init()
     await refresh_snapshot()
     asyncio.create_task(_periodic_refresh())
-    asyncio.create_task(daily_rollup_loop())
-    LOG.info("hermes-dashboard backend started on :8800")
+    LOG.info("hermes-dashboard backend started on :8800 (rollups from %s)", TOKEN_STATS_DIR)
 
 
 async def _periodic_refresh() -> None:
@@ -372,6 +318,8 @@ async def healthz() -> dict[str, Any]:
     return {
         "status": "running",
         "service": "Hermes Dashboard Backend",
+        "rollup_source": str(TOKEN_STATS_DIR),
+        "rollup_files": sum(1 for _ in TOKEN_STATS_DIR.glob("20*.json") if _.name != "summary.json") if TOKEN_STATS_DIR.exists() else 0,
         "snapshot_age_seconds": (
             int((datetime.now(CDT) - datetime.fromisoformat(SNAPSHOT.last_full_refresh)).total_seconds())
             if SNAPSHOT.last_full_refresh
@@ -388,8 +336,41 @@ async def snapshot() -> Snapshot:
 
 @app.get("/api/rollups")
 async def rollups() -> dict[str, Any]:
-    rows = db_get_all_rollups()
-    return {"rollups": rows, "count": len(rows)}
+    """Return daily rollups (authoritative: token_tracker.py cron output)."""
+    rows = _read_all_daily_rollups()
+    summary = _read_summary()
+    # Flatten each row to a flat shape for the frontend.
+    flat = []
+    for r in rows:
+        s = r.get("summary", {})
+        flat.append({
+            "date_local": r["date"],
+            "input_tokens": s.get("input_tokens", 0),
+            "output_tokens": s.get("output_tokens", 0),
+            "cache_read_tokens": s.get("cache_read_tokens", 0),
+            "cache_write_tokens": s.get("cache_write_tokens", 0),
+            "reasoning_tokens": s.get("reasoning_tokens", 0),
+            "total_tokens": s.get("total_tokens", 0),
+            "estimated_cost_usd": s.get("estimated_cost_usd", 0),
+            "total_sessions": s.get("total_sessions", 0),
+            "total_messages": s.get("total_messages", 0),
+            "total_tool_calls": s.get("total_tool_calls", 0),
+            "by_model": r.get("by_model", {}),
+            "generated_at": r.get("generated_at"),
+            "source": "token_tracker.py",
+        })
+    # Mark the most recent date as "live" if it equals today (CDT).
+    today = datetime.now(CDT).strftime("%Y-%m-%d")
+    if flat and flat[-1]["date_local"] == today:
+        flat[-1]["rollup_complete"] = 0
+    elif flat:
+        flat[-1]["rollup_complete"] = 1
+    return {
+        "rollups": flat,
+        "count": len(flat),
+        "summary": summary,
+        "today_local": today,
+    }
 
 
 @app.get("/api/services")
@@ -414,12 +395,9 @@ async def force_refresh() -> dict[str, str]:
 
 
 # -----------------------------------------------------------------------------
-# Static frontend (served from /static — built artifacts from `frontend/out/`)
+# Static frontend (served from backend/static/)
 # -----------------------------------------------------------------------------
-STATIC_DIR = Path(__file__).parent / "static"
-
 if STATIC_DIR.exists():
-    # Assets directory (Next.js _next/)
     _next_dir = STATIC_DIR / "_next"
     if _next_dir.exists():
         app.mount("/_next", StaticFiles(directory=_next_dir), name="next-assets")
@@ -430,11 +408,9 @@ if STATIC_DIR.exists():
 
     @app.get("/{path:path}")
     async def catch_all(path: str) -> FileResponse:
-        # Try the requested file first (assets like favicon.ico, *.svg)
         candidate = STATIC_DIR / path
         if candidate.is_file():
             return FileResponse(candidate)
-        # Fall back to index.html for client-side routing
         return FileResponse(STATIC_DIR / "index.html")
 
 

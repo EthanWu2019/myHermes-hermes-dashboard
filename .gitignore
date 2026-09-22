@@ -1,0 +1,11 @@
+# Dashboard backend (Python FastAPI)
+backend/__pycache__/
+backend/dashboard.db
+backend/dashboard.db-journal
+backend/static/
+backend/out/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
